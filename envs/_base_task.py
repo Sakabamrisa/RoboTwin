@@ -56,7 +56,11 @@ class Base_Task(gym.Env):
         super().__init__()
         ta.setup_logging("CRITICAL")  # hide logging
         np.random.seed(kwags.get("seed", 0))
-        torch.manual_seed(kwags.get("seed", 0))
+        seed = kwags.get("seed", 0)
+
+        # 避免 torch.manual_seed() 触发 torch.cuda.manual_seed_all()
+        # 这里环境初始化只需要 CPU 随机种子即可，GPU 主要交给 openpi/JAX 使用
+        torch.random.default_generator.manual_seed(seed)
         # random.seed(kwags.get('seed', 0))
 
         self.FRAME_IDX = 0
@@ -1484,6 +1488,9 @@ class Base_Task(gym.Env):
         if (self.eval_video_path is not None and self.take_action_cnt % eval_video_freq == 0):
             self.eval_video_ffmpeg.stdin.write(self.now_obs["observation"]["head_camera"]["rgb"].tobytes())
 
+        if self.save_data and self.FRAME_IDX == 0:
+            self._take_picture()
+
         self.take_action_cnt += 1
         print(f"step: \033[92m{self.take_action_cnt} / {self.step_lim}\033[0m", end="\r")
 
@@ -1625,6 +1632,7 @@ class Base_Task(gym.Env):
         right_gripper = np.array(right_gripper)
 
         now_left_id, now_right_id = 0, 0
+        control_idx = 0
 
         # ========== Control Loop ==========
         while now_left_id < left_n_step or now_right_id < right_n_step:
@@ -1653,15 +1661,23 @@ class Base_Task(gym.Env):
 
             self.scene.step()
             self._update_render()
+
+            if self.save_data and self.save_freq is not None and control_idx % self.save_freq == 0:
+                self._take_picture()
+            control_idx += 1
                 
             if self.check_success():
                 self.eval_success = True
                 self.get_obs() # update obs
+                if self.save_data:
+                    self._take_picture()
                 if (self.eval_video_path is not None):
                     self.eval_video_ffmpeg.stdin.write(self.now_obs["observation"]["head_camera"]["rgb"].tobytes())
                 return
 
         self._update_render()
+        if self.save_data:
+            self._take_picture()
         if self.render_freq:  # UI
             self.viewer.render()
 

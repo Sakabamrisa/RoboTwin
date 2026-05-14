@@ -1,6 +1,7 @@
 import sys
 import os
 import subprocess
+import json
 
 sys.path.append("./")
 sys.path.append(f"./policy")
@@ -61,6 +62,51 @@ def get_embodiment_config(robot_file):
     return embodiment_args
 
 
+def as_bool(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.lower() in ("1", "true", "yes", "y", "on")
+    return bool(value)
+
+
+def load_seed_list(seed_file):
+    with open(seed_file, "r", encoding="utf-8") as file:
+        return [int(seed) for seed in file.read().split()]
+
+
+def select_instruction(instruction_data, instruction_type):
+    candidates = instruction_data.get(instruction_type, [])
+    if candidates:
+        return np.random.choice(candidates)
+
+    for fallback_type in ("seen", "unseen"):
+        candidates = instruction_data.get(fallback_type, [])
+        if candidates:
+            return np.random.choice(candidates)
+
+    instruction = instruction_data.get("instruction")
+    if instruction:
+        return instruction
+
+    raise ValueError(f"No valid instruction found for type: {instruction_type}")
+
+
+def load_pregenerated_instruction(args, source_episode_idx, instruction_type):
+    instruction_dir = args.get("instruction_dir")
+    if instruction_dir is None:
+        instruction_dir = os.path.join("data", args["task_name"], args["task_config"], "instructions")
+
+    instruction_path = os.path.join(instruction_dir, f"episode{source_episode_idx}.json")
+    if not os.path.exists(instruction_path):
+        raise FileNotFoundError(f"Instruction file not found: {instruction_path}")
+
+    with open(instruction_path, "r", encoding="utf-8") as file:
+        instruction_data = json.load(file)
+
+    return instruction_data, select_instruction(instruction_data, instruction_type)
+
+
 def main(usr_args):
     current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     task_name = usr_args["task_name"]
@@ -78,9 +124,37 @@ def main(usr_args):
     with open(f"./task_config/{task_config}.yml", "r", encoding="utf-8") as f:
         args = yaml.load(f.read(), Loader=yaml.FullLoader)
 
+    runtime_arg_keys = (
+        "expert_check",
+        "target_fail_num",
+        "target_success_num",
+        "max_rollout_tries",
+        "merge_rollout_hdf5",
+        "save_failed_only",
+        "seed_file",
+        "instruction_dir",
+        "output_dir",
+        "test_num",
+        "eval_video_log",
+    )
+    for key in runtime_arg_keys:
+        if key in usr_args:
+            args[key] = usr_args[key]
+
     args['task_name'] = task_name
     args["task_config"] = task_config
     args["ckpt_setting"] = ckpt_setting
+
+    if "collect_wrist_camera" in usr_args:
+        args["camera"]["collect_wrist_camera"] = as_bool(usr_args["collect_wrist_camera"])
+    if "collect_head_camera" in usr_args:
+        args["camera"]["collect_head_camera"] = as_bool(usr_args["collect_head_camera"])
+    if "wrist_camera_type" in usr_args:
+        args["camera"]["wrist_camera_type"] = usr_args["wrist_camera_type"]
+    if "head_camera_type" in usr_args:
+        args["camera"]["head_camera_type"] = usr_args["head_camera_type"]
+    if "eval_video_log" in args:
+        args["eval_video_log"] = as_bool(args["eval_video_log"])
 
     embodiment_type = args.get("embodiment")
     embodiment_config_path = os.path.join(CONFIGS_PATH, "_embodiment_config.yml")
@@ -121,8 +195,16 @@ def main(usr_args):
     else:
         embodiment_name = str(embodiment_type[0]) + "+" + str(embodiment_type[1])
 
-    save_dir = Path(f"eval_result/{task_name}/{policy_name}/{task_config}/{ckpt_setting}/{current_time}")
+    output_dir = args.get("output_dir")
+    if output_dir is None:
+        save_dir = Path(f"eval_result/{task_name}/{policy_name}/{task_config}/{ckpt_setting}/{current_time}")
+    else:
+        save_dir = Path(output_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
+    rollout_save_dir = save_dir / "rollout_data"
+    rollout_save_dir.mkdir(parents=True, exist_ok=True)
+    args["save_data"] = True
+    args["save_path"] = str(rollout_save_dir)
 
     if args["eval_video_log"]:
         video_save_dir = save_dir
@@ -159,18 +241,19 @@ def main(usr_args):
 
     st_seed = 100000 * (1 + seed)
     suc_nums = []
-    test_num = 100
+    test_num = int(usr_args.get("test_num", 100))
     topk = 1
 
     model = get_model(usr_args)
-    st_seed, suc_num = eval_policy(task_name,
-                                   TASK_ENV,
-                                   args,
-                                   model,
-                                   st_seed,
-                                   test_num=test_num,
-                                   video_size=video_size,
-                                   instruction_type=instruction_type)
+    st_seed, suc_num, eval_attempt_num, rollout_fail_count = eval_policy(
+        task_name,
+        TASK_ENV,
+        args,
+        model,
+        st_seed,
+        test_num=test_num,
+        video_size=video_size,
+        instruction_type=instruction_type)
     suc_nums.append(suc_num)
 
     topk_success_rate = sorted(suc_nums, reverse=True)[:topk]
@@ -179,8 +262,11 @@ def main(usr_args):
     with open(file_path, "w") as file:
         file.write(f"Timestamp: {current_time}\n\n")
         file.write(f"Instruction Type: {instruction_type}\n\n")
-        # file.write(str(task_reward) + '\n')
-        file.write("\n".join(map(str, np.array(suc_nums) / test_num)))
+        file.write(f"Attempts: {eval_attempt_num}\n")
+        file.write(f"Success: {suc_num}\n")
+        file.write(f"Fail: {rollout_fail_count}\n")
+        if eval_attempt_num > 0:
+            file.write(f"Success Rate: {suc_num / eval_attempt_num}\n")
 
     print(f"Data has been saved to {file_path}")
     # return task_reward
@@ -197,12 +283,39 @@ def eval_policy(task_name,
     print(f"\033[34mTask Name: {args['task_name']}\033[0m")
     print(f"\033[34mPolicy Name: {args['policy_name']}\033[0m")
 
-    expert_check = True
+    expert_check = as_bool(args.get("expert_check", False))
+    merge_rollout_hdf5 = as_bool(args.get("merge_rollout_hdf5", False))
+    save_failed_only = as_bool(args.get("save_failed_only", True))
+    target_fail_num = int(args.get("target_fail_num", test_num))
+    target_success_num = args.get("target_success_num", None)
+    if target_success_num is not None:
+        target_success_num = int(target_success_num)
+
+    default_max_tries = max(test_num, target_fail_num) * 20
+    max_rollout_tries = int(args.get("max_rollout_tries", default_max_tries))
+
+    seed_file = args.get("seed_file")
+    if seed_file is None and not expert_check:
+        default_seed_file = os.path.join("data", args["task_name"], args["task_config"], "seed.txt")
+        if os.path.exists(default_seed_file):
+            seed_file = default_seed_file
+
+    seed_list = []
+    if seed_file is not None:
+        seed_list = load_seed_list(seed_file)
+        if not seed_list:
+            raise ValueError(f"Seed file is empty: {seed_file}")
+        print(f"\033[94mUsing seed file:\033[0m {seed_file} ({len(seed_list)} seeds)")
+
     TASK_ENV.suc = 0
     TASK_ENV.test_num = 0
 
     now_id = 0
-    succ_seed = 0
+    rollout_success_count = 0
+    rollout_fail_count = 0
+    rollout_try_count = 0
+    seed_attempt_count = 0
+    seed_cursor = 0
     suc_test_seed_list = []
 
     policy_name = args["policy_name"]
@@ -215,10 +328,39 @@ def eval_policy(task_name,
 
     args["eval_mode"] = True
 
-    while succ_seed < test_num:
+    def target_reached():
+        if rollout_fail_count < target_fail_num:
+            return False
+        if target_success_num is not None and rollout_success_count < target_success_num:
+            return False
+        return True
+
+    while not target_reached():
+        if seed_attempt_count >= max_rollout_tries:
+            raise RuntimeError(
+                f"Reached max_rollout_tries={max_rollout_tries} before target: "
+                f"success={rollout_success_count}/{target_success_num}, "
+                f"fail={rollout_fail_count}/{target_fail_num}"
+            )
+
+        if seed_list:
+            if seed_cursor >= len(seed_list):
+                raise RuntimeError(
+                    f"Seed file exhausted before target: "
+                    f"success={rollout_success_count}/{target_success_num}, "
+                    f"fail={rollout_fail_count}/{target_fail_num}"
+                )
+            now_seed = seed_list[seed_cursor]
+            source_episode_idx = seed_cursor
+            seed_cursor += 1
+        else:
+            source_episode_idx = seed_attempt_count
+
+        seed_attempt_count += 1
         render_freq = args["render_freq"]
         args["render_freq"] = 0
 
+        episode_info = None
         if expert_check:
             try:
                 TASK_ENV.setup_demo(now_ep_num=now_id, seed=now_seed, is_test=True, **args)
@@ -233,18 +375,32 @@ def eval_policy(task_name,
                 args["render_freq"] = render_freq
                 continue
             except Exception as e:
-                # stack_trace = traceback.format_exc()
-                # print(" -------------")
-                # print("Error: ", e)
-                # print(" -------------")
-                TASK_ENV.close_env()
-                now_seed += 1
+                import traceback
+
+                print("\n========== error occurs ==========", flush=True)
+                print("Error:", repr(e), flush=True)
+                traceback.print_exc()
+
+                try:
+                    TASK_ENV.close_env()
+                except Exception:
+                    print("close_env also failed:", flush=True)
+                    traceback.print_exc()
+
                 args["render_freq"] = render_freq
-                print("error occurs !")
-                continue
+                raise
+            # except Exception as e:
+            #     # stack_trace = traceback.format_exc()
+            #     # print(" -------------")
+            #     # print("Error: ", e)
+            #     # print(" -------------")
+            #     TASK_ENV.close_env()
+            #     now_seed += 1
+            #     args["render_freq"] = render_freq
+            #     print("error occurs !")
+            #     continue
 
         if (not expert_check) or (TASK_ENV.plan_success and TASK_ENV.check_success()):
-            succ_seed += 1
             suc_test_seed_list.append(now_seed)
         else:
             now_seed += 1
@@ -253,10 +409,31 @@ def eval_policy(task_name,
 
         args["render_freq"] = render_freq
 
-        TASK_ENV.setup_demo(now_ep_num=now_id, seed=now_seed, is_test=True, **args)
-        episode_info_list = [episode_info["info"]]
-        results = generate_episode_descriptions(args["task_name"], episode_info_list, test_num)
-        instruction = np.random.choice(results[0][instruction_type])
+        instructions_dir = os.path.join(args["save_path"], "instructions")
+        os.makedirs(instructions_dir, exist_ok=True)
+
+        try:
+            TASK_ENV.setup_demo(now_ep_num=now_id, seed=now_seed, is_test=True, **args)
+        except UnStableError as e:
+            TASK_ENV.close_env()
+            print(f"\033[93mSkip unstable rollout seed {now_seed}: {e}\033[0m")
+            now_seed += 1
+            continue
+
+        if expert_check:
+            episode_info_list = [episode_info["info"]]
+            results = generate_episode_descriptions(args["task_name"], episode_info_list, test_num)
+            if not results:
+                raise RuntimeError(f"No instruction generated for seed: {now_seed}")
+            instruction_data = results[0]
+            instruction = select_instruction(instruction_data, instruction_type)
+        else:
+            instruction_data, instruction = load_pregenerated_instruction(
+                args, source_episode_idx, instruction_type)
+
+        with open(os.path.join(instructions_dir, f"episode{now_id}.json"), "w", encoding="utf-8") as file:
+            json.dump(instruction_data, file, ensure_ascii=False, indent=2)
+
         TASK_ENV.set_instruction(instruction=instruction)  # set language instruction
 
         if TASK_ENV.eval_video_path is not None:
@@ -300,14 +477,29 @@ def eval_policy(task_name,
         if TASK_ENV.eval_video_path is not None:
             TASK_ENV._del_eval_video_ffmpeg()
 
+        if args.get("save_data", False) and hasattr(TASK_ENV, "folder_path"):
+            if merge_rollout_hdf5:
+                TASK_ENV.merge_pkl_to_hdf5_video()
+                TASK_ENV.remove_data_cache()
+            elif succ and save_failed_only:
+                TASK_ENV.remove_data_cache()
+        elif args.get("save_data", False):
+            print("\033[93mWarning: no rollout frames were saved for this episode.\033[0m")
+
         if succ:
+            rollout_success_count += 1
             TASK_ENV.suc += 1
             print("\033[92mSuccess!\033[0m")
         else:
+            rollout_fail_count += 1
             print("\033[91mFail!\033[0m")
 
-        now_id += 1
-        TASK_ENV.close_env(clear_cache=((succ_seed + 1) % clear_cache_freq == 0))
+        rollout_try_count += 1
+        keep_episode = (not succ) or (not save_failed_only)
+        if keep_episode:
+            now_id += 1
+
+        TASK_ENV.close_env(clear_cache=((TASK_ENV.test_num + 1) % clear_cache_freq == 0))
 
         if TASK_ENV.render_freq:
             TASK_ENV.viewer.close()
@@ -316,12 +508,13 @@ def eval_policy(task_name,
 
         print(
             f"\033[93m{task_name}\033[0m | \033[94m{args['policy_name']}\033[0m | \033[92m{args['task_config']}\033[0m | \033[91m{args['ckpt_setting']}\033[0m\n"
-            f"Success rate: \033[96m{TASK_ENV.suc}/{TASK_ENV.test_num}\033[0m => \033[95m{round(TASK_ENV.suc/TASK_ENV.test_num*100, 1)}%\033[0m, current seed: \033[90m{now_seed}\033[0m\n"
+            f"Success rate: \033[96m{TASK_ENV.suc}/{TASK_ENV.test_num}\033[0m => \033[95m{round(TASK_ENV.suc/TASK_ENV.test_num*100, 1)}%\033[0m, "
+            f"fail target: \033[96m{rollout_fail_count}/{target_fail_num}\033[0m, current seed: \033[90m{now_seed}\033[0m\n"
         )
         # TASK_ENV._take_picture()
         now_seed += 1
 
-    return now_seed, TASK_ENV.suc
+    return now_seed, TASK_ENV.suc, TASK_ENV.test_num, rollout_fail_count
 
 
 def parse_args_and_config():

@@ -14,8 +14,8 @@ from pi_model import *
 def encode_obs(observation):
     input_rgb_arr = [
         observation["observation"]["head_camera"]["rgb"],
-        observation["observation"]["right_camera"]["rgb"],
-        observation["observation"]["left_camera"]["rgb"],
+        None,
+        None,
     ]
     input_state = observation["joint_action"]["vector"]
 

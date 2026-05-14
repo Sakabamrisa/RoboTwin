@@ -20,6 +20,7 @@ import argparse
 import pdb
 
 from generate_episode_instructions import *
+from eval_policy import as_bool, eval_policy as rollout_eval_policy
 
 
 import sys
@@ -225,29 +226,107 @@ class ModelClient:
         self.close()
 
 
+class PI05ApiModel:
+    def __init__(self, host="127.0.0.1", port=8000, pi0_step=50):
+        openpi_client_path = os.path.join(
+            parent_directory,
+            "../policy/pi05/packages/openpi-client/src",
+        )
+        sys.path.insert(0, os.path.abspath(openpi_client_path))
+
+        from openpi_client import websocket_client_policy
+
+        self.policy = websocket_client_policy.WebsocketClientPolicy(host, port)
+        self.observation_window = None
+        self.instruction = None
+        self.pi0_step = int(pi0_step)
+
+    def set_language(self, instruction):
+        self.instruction = instruction
+        print(f"successfully set instruction:{instruction}")
+
+    def update_observation_window(self, img_arr, state):
+        img_front, img_right, img_left, puppet_arm = (
+            img_arr[0],
+            img_arr[1],
+            img_arr[2],
+            state,
+        )
+        img_front = np.transpose(img_front, (2, 0, 1))
+        images = {
+            "cam_high": img_front,
+        }
+        if img_left is not None:
+            images["cam_left_wrist"] = np.transpose(img_left, (2, 0, 1))
+        if img_right is not None:
+            images["cam_right_wrist"] = np.transpose(img_right, (2, 0, 1))
+
+        self.observation_window = {
+            "state": state,
+            "images": images,
+            "prompt": self.instruction,
+        }
+
+    def get_action(self):
+        assert self.observation_window is not None, "update observation_window first!"
+        return self.policy.infer(self.observation_window)["actions"]
+
+    def reset_obsrvationwindows(self):
+        self.instruction = None
+        self.observation_window = None
+        print("successfully unset obs and language intruction")
+
+
 def main(usr_args):
     current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     task_name = usr_args["task_name"]
     task_config = usr_args["task_config"]
     ckpt_setting = usr_args["ckpt_setting"]
     # checkpoint_num = usr_args['checkpoint_num']
-    policy_name = usr_args["policy_name"]
+    policy_name = usr_args.get("policy_name") or "pi05"
     instruction_type = usr_args["instruction_type"]
-    port = usr_args["port"]
+    port = usr_args.get("port") or 8000
+    host = usr_args.get("host", "127.0.0.1")
     save_dir = None
     video_save_dir = None
     video_size = None
 
     policy_conda_env = usr_args.get("policy_conda_env", None)
 
-    get_model = eval_function_decorator(policy_name, "get_model", conda_env=policy_conda_env)
-
     with open(f"./task_config/{task_config}.yml", "r", encoding="utf-8") as f:
         args = yaml.load(f.read(), Loader=yaml.FullLoader)
+
+    runtime_arg_keys = (
+        "expert_check",
+        "target_fail_num",
+        "target_success_num",
+        "max_rollout_tries",
+        "merge_rollout_hdf5",
+        "save_failed_only",
+        "seed_file",
+        "instruction_dir",
+        "output_dir",
+        "test_num",
+        "eval_video_log",
+    )
+    for key in runtime_arg_keys:
+        if key in usr_args:
+            args[key] = usr_args[key]
 
     args['task_name'] = task_name
     args["task_config"] = task_config
     args["ckpt_setting"] = ckpt_setting
+
+    if "collect_wrist_camera" in usr_args:
+        args["camera"]["collect_wrist_camera"] = as_bool(usr_args["collect_wrist_camera"])
+    if "collect_head_camera" in usr_args:
+        args["camera"]["collect_head_camera"] = as_bool(usr_args["collect_head_camera"])
+    if "wrist_camera_type" in usr_args:
+        args["camera"]["wrist_camera_type"] = usr_args["wrist_camera_type"]
+    if "head_camera_type" in usr_args:
+        args["camera"]["head_camera_type"] = usr_args["head_camera_type"]
+    if "eval_video_log" in args:
+        args["eval_video_log"] = as_bool(args["eval_video_log"])
 
     embodiment_type = args.get("embodiment")
     embodiment_config_path = os.path.join(CONFIGS_PATH, "_embodiment_config.yml")
@@ -288,8 +367,16 @@ def main(usr_args):
     else:
         embodiment_name = str(embodiment_type[0]) + "+" + str(embodiment_type[1])
 
-    save_dir = Path(f"eval_result/{task_name}/{policy_name}/{task_config}/{ckpt_setting}/{current_time}")
+    output_dir = args.get("output_dir")
+    if output_dir is None:
+        save_dir = Path(f"eval_result/{task_name}/{policy_name}/{task_config}/{ckpt_setting}/{current_time}")
+    else:
+        save_dir = Path(output_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
+    rollout_save_dir = save_dir / "rollout_data"
+    rollout_save_dir.mkdir(parents=True, exist_ok=True)
+    args["save_data"] = True
+    args["save_path"] = str(rollout_save_dir)
 
     if args["eval_video_log"]:
         video_save_dir = save_dir
@@ -322,24 +409,25 @@ def main(usr_args):
     usr_args["left_arm_dim"] = len(args["left_embodiment_config"]["arm_joints_name"][0])
     usr_args["right_arm_dim"] = len(args["right_embodiment_config"]["arm_joints_name"][1])
 
-    seed = usr_args["seed"]
+    seed = usr_args.get("seed")
+    if seed is None:
+        seed = 0
 
     st_seed = 100000 * (1 + seed)
     suc_nums = []
-    test_num = 100
+    test_num = int(usr_args.get("test_num", 100))
     topk = 1
 
-    # model = get_model(usr_args)
-    model = ModelClient(port=port)
-    st_seed, suc_num = eval_policy(task_name,
-                                   TASK_ENV,
-                                   args,
-                                   model,
-                                   st_seed,
-                                   test_num=test_num,
-                                   video_size=video_size,
-                                   instruction_type=instruction_type,
-                                   policy_conda_env=policy_conda_env)
+    model = PI05ApiModel(host=host, port=port, pi0_step=usr_args["pi0_step"])
+    st_seed, suc_num, eval_attempt_num, rollout_fail_count = rollout_eval_policy(
+        task_name,
+        TASK_ENV,
+        args,
+        model,
+        st_seed,
+        test_num=test_num,
+        video_size=video_size,
+        instruction_type=instruction_type)
     suc_nums.append(suc_num)
 
     topk_success_rate = sorted(suc_nums, reverse=True)[:topk]
@@ -348,8 +436,11 @@ def main(usr_args):
     with open(file_path, "w") as file:
         file.write(f"Timestamp: {current_time}\n\n")
         file.write(f"Instruction Type: {instruction_type}\n\n")
-        # file.write(str(task_reward) + '\n')
-        file.write("\n".join(map(str, np.array(suc_nums) / test_num)))
+        file.write(f"Attempts: {eval_attempt_num}\n")
+        file.write(f"Success: {suc_num}\n")
+        file.write(f"Fail: {rollout_fail_count}\n")
+        if eval_attempt_num > 0:
+            file.write(f"Success Rate: {suc_num / eval_attempt_num}\n")
 
     print(f"Data has been saved to {file_path}")
     # return task_reward
@@ -495,6 +586,7 @@ def eval_policy(task_name,
 
 def parse_args_and_config():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--host", type=str, default="127.0.0.1")
     parser.add_argument("--port", type=int)
     parser.add_argument("--config", type=str, required=True)
     parser.add_argument("--overrides", nargs=argparse.REMAINDER)
@@ -503,6 +595,7 @@ def parse_args_and_config():
     with open(args.config, "r", encoding="utf-8") as f:
         config = yaml.safe_load(f)
 
+    config["host"] = args.host
     config['port'] = args.port
 
     # Parse overrides

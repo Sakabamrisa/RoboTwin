@@ -64,16 +64,17 @@ class PI0:
             state,
         )
         img_front = np.transpose(img_front, (2, 0, 1))
-        img_right = np.transpose(img_right, (2, 0, 1))
-        img_left = np.transpose(img_left, (2, 0, 1))
+        images = {
+            "cam_high": img_front,
+        }
+        if img_left is not None:
+            images["cam_left_wrist"] = np.transpose(img_left, (2, 0, 1))
+        if img_right is not None:
+            images["cam_right_wrist"] = np.transpose(img_right, (2, 0, 1))
 
         self.observation_window = {
             "state": state,
-            "images": {
-                "cam_high": img_front,
-                "cam_left_wrist": img_left,
-                "cam_right_wrist": img_right,
-            },
+            "images": images,
             "prompt": self.instruction,
         }
 
